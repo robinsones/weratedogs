@@ -1,0 +1,190 @@
+---
+title: "We Rate Dogs tweets"
+output: html_document
+---
+
+# TODO WE RATE DOGS REUSES NAMES BOOO
+# that's why space gets added to the end of the file, because it already existed
+# no way to tell which is which, guess just have to remove duplicate names 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(rtweet)
+library(magick)
+library(reticulate)
+library(fs)
+```
+
+### Get and Resize WeRateDogs images
+
+```{r}
+weratedogs <- get_timeline("dog_rates", n = 3200)
+
+cleaned_weratedogs <- weratedogs %>% 
+  mutate(media_url = as.character(media_url)) %>%
+  filter(!is.na(media_url), is.na(reply_to_status_id)) %>%
+  select(text, media_url) %>%
+  mutate(rating = str_extract(text, "\\d+/"), 
+         name = str_extract(text, "This is [A-Za-z]+.")) %>%
+  filter(!is.na(rating), 
+         !is.na(name)) %>%
+  mutate(name = str_remove(name, "This is ")) %>%
+  mutate(name = str_remove(name, "\\."),
+         rating = str_remove(rating, "/"),
+         name = str_remove(name, " ")) %>%
+  filter(rating <= 15) %>%
+  mutate(dichotimized_rating = if_else(rating <= 13, 0, 1)) %>%
+  # remove duplicate names 
+  add_count(name) %>%
+  filter(n == 1)
+
+saveRDS(cleaned_weratedogs, "weratedogs_data.rds")
+```
+
+```{r}
+walk2(cleaned_weratedogs$media_url, cleaned_weratedogs$name, 
+      ~download.file(.x, paste0(.y, ".jpg")))
+```
+
+```{r}
+jpg_files <- dir_ls(regexp = "\\.jpg$")
+```
+
+Make them all 750x1000
+
+```{r}
+read_scale_and_write <- function(image_name) { 
+  image_name %>%
+    image_read() %>%
+    image_scale("750x1000!") %>%
+    image_write(path = paste0("resized_images/", image_name), format = "jpg")
+}
+```
+
+```{r}
+dir_create("resized_images")
+walk(jpg_files, read_scale_and_write)
+#delete original files
+walk(jpg_files, file_delete)
+```
+
+### Upload to AWS
+
+```{r}
+# You'll need set your environment with AWS variables
+usethis::edit_r_environ()
+#   AWS_ACCESS_KEY_ID = "abc",
+#  AWS_SECRET_ACCESS_KEY = "dfg",
+#  AWS_REGION = "us-east-1"
+
+```
+
+```{r}
+# Do once 
+# py_install("sagemaker-python-sdk")
+# py_install("pandas")
+boto3 <- import('boto3')
+```
+
+```{r}
+s3 <- boto3$client('s3', 
+                   aws_secret_access_key = Sys.getenv('AWS_SECRET_ACCESS_KEY'),
+                   aws_access_key_id = Sys.getenv('AWS_ACCESS_KEY_ID'))
+```
+
+### Set up training and test set
+
+mini_weratedogs
+
+```{r}
+set.seed(42)
+setwd("resized_images")
+resized_images_files <- fs::dir_ls(regexp = "\\.jpg$")
+holdout_set <- sample(resized_images_files, length(resized_images_files)/10)
+fs::dir_create("holdout/image_directory")
+fs::dir_create("train/image_directory")
+fs::dir_create("validation/image_directory")
+walk(holdout_set, ~ fs::file_move(.x, paste0( "holdout/image_directory/", .x)))
+remaining_images <- setdiff(resized_images_files, holdout_set)
+train_set <- sample(remaining_images, length(remaining_images)*.70)
+walk(train_set, ~ fs::file_move(.x, paste0("train/image_directory/", .x)))
+validation_set <- fs::dir_ls(regexp = "\\.jpg$")
+walk(validation_set, ~ fs::file_move(.x, paste0("validation/image_directory/", .x)))
+```
+
+# create files with .lst
+```{r}
+pictures_split <- tibble("file_name" = holdout_set, "location" = "holdout") %>%
+  bind_rows(tibble("file_name" = validation_set, "location" = "validation")) %>%
+  bind_rows(tibble("file_name" = train_set, "location" = "train")) %>%
+  mutate(file_name = as.character(file_name))
+cleaned_weratedogs %>%
+  mutate(file_name = paste0(name, ".jpg")) %>%
+  inner_join(pictures_split, by = "file_name") %>%
+  mutate(file_location = paste0("image_directory/", file_name),
+         index = row_number()) 
+  
+```
+
+
+```{r}
+s3$create_bucket(Bucket = "dogrates")
+walk(.x = c(fs::dir_ls("holdout"), fs::dir_ls("train"), fs::dir_ls("validation")), 
+     .f = ~ s3$put_object(Bucket = "dogrates",
+                                   Body = eval(as.expression(.x)),
+                                   Key = str_remove(.x, " ")))
+
+setwd("..")
+```
+
+### Get model ready 
+
+```{r}
+s3_train_key = "image-classification-full-training/train"
+s3_validation_key = "image-classification-full-training/validation"
+s3_train = "s3://{}/{}/".format(bucket, s3_train_key)
+s3_validation = "s3://{}/{}/".format(bucket, s3_validation_key)
+```
+
+weratedogs/train/all_images/happy.jpg
+Log onto the console -> IAM -> Roles -> Create Role
+Create a service-linked role with sagemaker.amazonaws.com
+Give the role AmazonSageMakerFullAccess
+Give the role AmazonS3FullAccess (<-- scope down if reasonable)
+Then use the name in RoleName= like above
+From https://github.com/aws/sagemaker-python-sdk/issues/300
+
+```{r}
+iam <- boto3$client('iam', 
+                   aws_secret_access_key = Sys.getenv('AWS_SECRET_ACCESS_KEY'),
+                   aws_access_key_id = Sys.getenv('AWS_ACCESS_KEY_ID'),
+                   region_name = "us-east-1")
+role_arn <- iam$get_role(RoleName = "sagemaker_role")$Role$Arn
+```
+
+```{r}
+# this doesn't work, so found it manually with jupyter notebook 
+#training_image <- sagemaker$image_uris$retrieve(framework = "image_classification", region ="us-east-1")
+training_image <- "811284229777.dkr.ecr.us-east-1.amazonaws.com/image-classification:1"
+```
+
+## Set up model training
+
+```{r}
+sagemaker <- import('sagemaker')
+
+```
+
+```{r}
+ic <- sagemaker$estimator$Estimator(
+  training_image, 
+  role_arn,
+  instance_count = 1,
+  instance_type = "ml.p2.xlarge",
+  volume_size = 50,
+  max_run = 360000,
+  input_mode = ,
+  output_path = "s3://weratedogs/ic-fulltraining/output",
+)
+```
+
