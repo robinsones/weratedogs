@@ -39,6 +39,7 @@ cleaned_weratedogs <- weratedogs %>%
   filter(n == 1)
 
 saveRDS(cleaned_weratedogs, "weratedogs_data.rds")
+# cleaned_weratedogs <- readRDS("weratedogs_data.rds")
 ```
 
 ```{r}
@@ -94,8 +95,6 @@ s3 <- boto3$client('s3',
 
 ### Set up training and test set
 
-mini_weratedogs
-
 ```{r}
 set.seed(42)
 setwd("resized_images")
@@ -113,38 +112,66 @@ walk(validation_set, ~ fs::file_move(.x, paste0("validation/image_directory/", .
 ```
 
 # create files with .lst
+
+Temporary
+
+```{r}
+holdout_set <- fs::dir_ls("resized_images/holdout/image_directory")
+train_set <- fs::dir_ls("resized_images/train/image_directory")
+validation_set <- fs::dir_ls("resized_images/validation/image_directory")
+```
+
 ```{r}
 pictures_split <- tibble("file_name" = holdout_set, "location" = "holdout") %>%
   bind_rows(tibble("file_name" = validation_set, "location" = "validation")) %>%
   bind_rows(tibble("file_name" = train_set, "location" = "train")) %>%
-  mutate(file_name = as.character(file_name))
-cleaned_weratedogs %>%
+  mutate(file_name = as.character(file_name)) %>%
+  mutate(file_name = str_remove(file_name, "resized_images/validation/image_directory/"),
+         file_name = str_remove(file_name, "resized_images/train/image_directory/"),
+         file_name = str_remove(file_name, "resized_images/holdout/image_directory/"))
+
+lst_info <- cleaned_weratedogs %>%
   mutate(file_name = paste0(name, ".jpg")) %>%
   inner_join(pictures_split, by = "file_name") %>%
   mutate(file_location = paste0("image_directory/", file_name),
          index = row_number()) 
-  
+
+train_lst <- lst_info %>%
+  filter(location == "train") %>%
+  select(index, dichotimized_rating, file_location) %>%
+  mutate(file_location = str_remove(file_location, "image_directory/"))
+
+validation_lst <- lst_info %>%
+  filter(location == "validation") %>%
+  select(index, dichotimized_rating, file_location) %>%
+  mutate(file_location = str_remove(file_location, "image_directory/"))
+
+write.table(validation_lst, file = "resized_images/validation/validation_lst.lst",
+            sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
+
+write.table(train_lst, file = "resized_images/train/train_lst.lst",
+            sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
 ```
 
 
 ```{r}
 s3$create_bucket(Bucket = "dogrates")
-walk(.x = c(fs::dir_ls("holdout"), fs::dir_ls("train"), fs::dir_ls("validation")), 
+walk(.x = c(fs::dir_ls("holdout/image_directory"), fs::dir_ls("train/image_directory"), fs::dir_ls("validation/image_directory")),
      .f = ~ s3$put_object(Bucket = "dogrates",
                                    Body = eval(as.expression(.x)),
                                    Key = str_remove(.x, " ")))
-
-setwd("..")
+s3$upload_file(Bucket = "dogrates",
+              Filename = "resized_images/validation/validation_lst.lst", 
+              Key = "validation/validation_lst.lst")
+s3$upload_file(Bucket = "dogrates",
+              Filename = "resized_images/train/train_lst.lst",
+              Key = "train/train_lst.lst")
 ```
 
 ### Get model ready 
 
-```{r}
-s3_train_key = "image-classification-full-training/train"
-s3_validation_key = "image-classification-full-training/validation"
-s3_train = "s3://{}/{}/".format(bucket, s3_train_key)
-s3_validation = "s3://{}/{}/".format(bucket, s3_validation_key)
-```
+https://github.com/aws/amazon-sagemaker-examples/blob/master/introduction_to_amazon_algorithms/imageclassification_caltech/Image-classification-fulltraining-highlevel.ipynb
+
 
 weratedogs/train/all_images/happy.jpg
 Log onto the console -> IAM -> Roles -> Create Role
@@ -172,6 +199,7 @@ training_image <- "811284229777.dkr.ecr.us-east-1.amazonaws.com/image-classifica
 
 ```{r}
 sagemaker <- import('sagemaker')
+sess <- sagemaker$Session(boto3$session$Session(region_name = "us-east-1"))
 
 ```
 
@@ -179,12 +207,68 @@ sagemaker <- import('sagemaker')
 ic <- sagemaker$estimator$Estimator(
   training_image, 
   role_arn,
-  instance_count = 1,
+  instance_count = as.integer(1),
   instance_type = "ml.p2.xlarge",
-  volume_size = 50,
-  max_run = 360000,
-  input_mode = ,
-  output_path = "s3://weratedogs/ic-fulltraining/output",
+  volume_size = as.integer(50),
+  input_mode = "File",
+  output_path = "s3://dogrates/ic-fulltraining/output",
+  sagemaker_session = sess
 )
 ```
 
+```{r}
+# train_set <- dir_ls("resized_images/train/image_directory")
+ic$set_hyperparameters(
+    num_layers=as.integer(18),
+    image_shape="3,750,1000",
+    num_classes=as.integer(2),
+    num_training_samples=length(train_set),
+    mini_batch_size=as.integer(128),
+    epochs=as.integer(5),
+    top_k=as.integer(2),
+    precision_dtype="float32"
+)
+```
+
+https://sagemaker-examples.readthedocs.io/en/latest/introduction_to_amazon_algorithms/imageclassification_caltech/Image-classification-lst-format-highlevel.html
+```{r}
+s3train <- "s3://dogrates/train/image_directory/"
+s3validation <- "s3://dogrates/validation/image_directory/"
+s3train_lst <- "s3://dogrates/train/"
+s3validation_lst <- "s3://dogrates/validation/"
+
+train_data <- sagemaker$inputs$TrainingInput(
+    s3_data = s3train,
+    distribution="FullyReplicated",
+    content_type="application/x-image",
+    s3_data_type="S3Prefix"
+)
+validation_data <- sagemaker$inputs$TrainingInput(
+    s3validation,
+    distribution="FullyReplicated",
+    content_type="application/x-image",
+    s3_data_type="S3Prefix"
+)
+train_data_lst <- sagemaker$inputs$TrainingInput(
+    s3train_lst,
+    distribution="FullyReplicated",
+    content_type="application/x-image",
+    s3_data_type="S3Prefix"
+)
+
+validation_data_lst <- sagemaker$inputs$TrainingInput(
+    s3validation_lst,
+    distribution="FullyReplicated",
+    content_type="application/x-image",
+    s3_data_type="S3Prefix"
+)
+
+data_channels <- py_dict(keys = c("train", "validation", "train_lst", "validation_lst"), 
+                         values = c(train_data, validation_data, train_data_lst, validation_data_lst))
+```
+
+```{r}
+ic$fit(inputs = data_channels, logs = TRUE)
+```
+
+https://medium.com/data-science-bootcamp/amazon-sagemaker-ml-p2-xlarge-8b9cbc0dd7d
