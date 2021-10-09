@@ -138,13 +138,11 @@ lst_info <- cleaned_weratedogs %>%
 
 train_lst <- lst_info %>%
   filter(location == "train") %>%
-  select(index, dichotimized_rating, file_location) %>%
-  mutate(file_location = str_remove(file_location, "image_directory/"))
+  select(index, dichotimized_rating, file_location) 
 
 validation_lst <- lst_info %>%
   filter(location == "validation") %>%
-  select(index, dichotimized_rating, file_location) %>%
-  mutate(file_location = str_remove(file_location, "image_directory/"))
+  select(index, dichotimized_rating, file_location)
 
 write.table(validation_lst, file = "resized_images/validation/validation_lst.lst",
             sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
@@ -155,17 +153,17 @@ write.table(train_lst, file = "resized_images/train/train_lst.lst",
 
 
 ```{r}
-s3$create_bucket(Bucket = "dogrates")
-walk(.x = c(fs::dir_ls("holdout/image_directory"), fs::dir_ls("train/image_directory"), fs::dir_ls("validation/image_directory")),
-     .f = ~ s3$put_object(Bucket = "dogrates",
-                                   Body = eval(as.expression(.x)),
-                                   Key = str_remove(.x, " ")))
-s3$upload_file(Bucket = "dogrates",
+s3$create_bucket(Bucket = "weratedogs")
+walk(.x = c(fs::dir_ls("resized_images/holdout/image_directory"), fs::dir_ls("resized_images/train/image_directory"), fs::dir_ls("resized_images/validation/image_directory")),
+     .f = ~ s3$upload_file(Bucket = "weratedogs",
+                                   Filename = .x,
+                                   Key = str_remove(.x, "resized_images/")))
+s3$upload_file(Bucket = "weratedogs",
               Filename = "resized_images/validation/validation_lst.lst", 
-              Key = "validation/validation_lst.lst")
-s3$upload_file(Bucket = "dogrates",
+              Key = "validation_lst/validation_lst.lst")
+s3$upload_file(Bucket = "weratedogs",
               Filename = "resized_images/train/train_lst.lst",
-              Key = "train/train_lst.lst")
+              Key = "train_lst/train_lst.lst")
 ```
 
 ### Get model ready 
@@ -220,10 +218,10 @@ ic <- sagemaker$estimator$Estimator(
 # train_set <- dir_ls("resized_images/train/image_directory")
 ic$set_hyperparameters(
     num_layers=as.integer(18),
-    image_shape="3,750,1000",
+    image_shape="3,1000,750",
     num_classes=as.integer(2),
     num_training_samples=length(train_set),
-    mini_batch_size=as.integer(128),
+    mini_batch_size=as.integer(16),
     epochs=as.integer(5),
     top_k=as.integer(2),
     precision_dtype="float32"
@@ -232,10 +230,10 @@ ic$set_hyperparameters(
 
 https://sagemaker-examples.readthedocs.io/en/latest/introduction_to_amazon_algorithms/imageclassification_caltech/Image-classification-lst-format-highlevel.html
 ```{r}
-s3train <- "s3://dogrates/train/image_directory/"
-s3validation <- "s3://dogrates/validation/image_directory/"
-s3train_lst <- "s3://dogrates/train/"
-s3validation_lst <- "s3://dogrates/validation/"
+s3train <- "s3://weratedogs/train/"
+s3validation <- "s3://weratedogs/validation/"
+s3train_lst <- "s3://weratedogs/train_lst/"
+s3validation_lst <- "s3://weratedogs/validation_lst/"
 
 train_data <- sagemaker$inputs$TrainingInput(
     s3_data = s3train,
@@ -267,8 +265,57 @@ data_channels <- py_dict(keys = c("train", "validation", "train_lst", "validatio
                          values = c(train_data, validation_data, train_data_lst, validation_data_lst))
 ```
 
+Then try moving lst files into validation_lst and train_list folders instead
 ```{r}
 ic$fit(inputs = data_channels, logs = TRUE)
 ```
 
 https://medium.com/data-science-bootcamp/amazon-sagemaker-ml-p2-xlarge-8b9cbc0dd7d
+
+have to do as.integer() otherwise get error about class float instead of class int 
+```{r}
+transformer <- ic$transformer(instance_count=as.integer(1), instance_type='ml.m4.xlarge')
+```
+
+```{r}
+transformer$transform(s3validation)
+```
+
+You have to do a batch transform job to figure out how your model performed in terms of actual predictions - can get accuracy from the logs but maybe just predicted everything is one class. 
+
+# look at 
+
+```{python}
+import boto3
+s3_client = boto3.client("s3")
+import numpy as np
+import json
+s3validation = "s3://weratedogs/validation/"
+bucket = "weratedogs"
+object_categories = ["low", "high"]
+from urllib.parse import urlparse
+batch_job_name = "image-classification-2021-10-09-00-48-44-562"
+def list_objects(s3_client, bucket, prefix):
+    response = s3_client.list_objects(Bucket=bucket, Prefix=prefix)
+    objects = [content["Key"] for content in response["Contents"]]
+    return objects
+  
+def get_label(s3_client, bucket, prefix):
+    filename = prefix.split("/")[-1]
+    s3_client.download_file(bucket, prefix, filename)
+    with open(filename) as f:
+        data = json.load(f)
+        index = np.argmax(data["prediction"])
+        probability = data["prediction"][index]
+    return object_categories[index], probability
+
+inputs = list_objects(s3_client, bucket, urlparse(s3validation).path.lstrip("/"))
+print("Sample inputs: " + str(inputs[:2]))
+
+outputs = list_objects(s3_client, "sagemaker-us-east-1-461249631240", batch_job_name + "/image_directory")
+print("Sample output: " + str(outputs[:2]))
+
+labels = [get_label(s3_client, "sagemaker-us-east-1-461249631240", prefix) for prefix in outputs]
+```
+
+
