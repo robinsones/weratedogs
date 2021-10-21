@@ -3,9 +3,6 @@ title: "We Rate Dogs tweets"
 output: html_document
 ---
 
-# TODO WE RATE DOGS REUSES NAMES BOOO
-# that's why space gets added to the end of the file, because it already existed
-# no way to tell which is which, guess just have to remove duplicate names 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
@@ -43,6 +40,7 @@ saveRDS(cleaned_weratedogs, "weratedogs_data.rds")
 ```
 
 ```{r}
+# Download the images of all the dogs
 walk2(cleaned_weratedogs$media_url, cleaned_weratedogs$name, 
       ~download.file(.x, paste0(.y, ".jpg")))
 ```
@@ -69,46 +67,26 @@ walk(jpg_files, read_scale_and_write)
 walk(jpg_files, file_delete)
 ```
 
-### Upload to AWS
-
-```{r}
-# You'll need set your environment with AWS variables
-usethis::edit_r_environ()
-#   AWS_ACCESS_KEY_ID = "abc",
-#  AWS_SECRET_ACCESS_KEY = "dfg",
-#  AWS_REGION = "us-east-1"
-
-```
-
-```{r}
-# Do once 
-# py_install("sagemaker-python-sdk")
-# py_install("pandas")
-boto3 <- import('boto3')
-```
-
-```{r}
-s3 <- boto3$client('s3', 
-                   aws_secret_access_key = Sys.getenv('AWS_SECRET_ACCESS_KEY'),
-                   aws_access_key_id = Sys.getenv('AWS_ACCESS_KEY_ID'))
-```
-
-### Set up training and test set
+### Set up training, validation, and holdout set
 
 ```{r}
 set.seed(42)
 setwd("resized_images")
-resized_images_files <- fs::dir_ls(regexp = "\\.jpg$")
+dir_create("holdout/image_directory")
+dir_create("train/image_directory")
+dir_create("validation/image_directory")
+
+resized_images_files <- dir_ls(regexp = "\\.jpg$")
 holdout_set <- sample(resized_images_files, length(resized_images_files)/10)
-fs::dir_create("holdout/image_directory")
-fs::dir_create("train/image_directory")
-fs::dir_create("validation/image_directory")
-walk(holdout_set, ~ fs::file_move(.x, paste0( "holdout/image_directory/", .x)))
+walk(holdout_set, ~ file_move(.x, paste0( "holdout/image_directory/", .x)))
+
 remaining_images <- setdiff(resized_images_files, holdout_set)
 train_set <- sample(remaining_images, length(remaining_images)*.70)
-walk(train_set, ~ fs::file_move(.x, paste0("train/image_directory/", .x)))
-validation_set <- fs::dir_ls(regexp = "\\.jpg$")
-walk(validation_set, ~ fs::file_move(.x, paste0("validation/image_directory/", .x)))
+walk(train_set, ~ file_move(.x, paste0("train/image_directory/", .x)))
+
+# move remaining files to validation folder
+validation_set <- dir_ls(regexp = "\\.jpg$")
+walk(validation_set, ~ file_move(.x, paste0("validation/image_directory/", .x)))
 ```
 
 # create files with .lst
@@ -116,9 +94,9 @@ walk(validation_set, ~ fs::file_move(.x, paste0("validation/image_directory/", .
 Temporary
 
 ```{r}
-holdout_set <- fs::dir_ls("resized_images/holdout/image_directory")
-train_set <- fs::dir_ls("resized_images/train/image_directory")
-validation_set <- fs::dir_ls("resized_images/validation/image_directory")
+holdout_set <- dir_ls("resized_images/holdout/image_directory")
+train_set <- dir_ls("resized_images/train/image_directory")
+validation_set <- dir_ls("resized_images/validation/image_directory")
 ```
 
 ```{r}
@@ -151,16 +129,45 @@ write.table(train_lst, file = "resized_images/train/train_lst.lst",
             sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
 ```
 
+### Upload to AWS
 
 ```{r}
+# You'll need set your environment with AWS variables
+usethis::edit_r_environ()
+#   AWS_ACCESS_KEY_ID = "abc",
+#  AWS_SECRET_ACCESS_KEY = "dfg",
+#  AWS_REGION = "us-east-1"
+```
+
+```{r}
+# Only need to install the packages once 
+# py_install("sagemaker-python-sdk")
+# py_install("pandas")
+```
+
+```{r}
+boto3 <- import('boto3')
+s3 <- boto3$client('s3', 
+                   aws_secret_access_key = Sys.getenv('AWS_SECRET_ACCESS_KEY'),
+                   aws_access_key_id = Sys.getenv('AWS_ACCESS_KEY_ID'))
+```
+
+```{r}
+all_images <- c(dir_ls("resized_images/holdout/image_directory"),
+                dir_ls("resized_images/train/image_directory"),
+                dir_ls("resized_images/validation/image_directory"))
+
 s3$create_bucket(Bucket = "weratedogs")
-walk(.x = c(fs::dir_ls("resized_images/holdout/image_directory"), fs::dir_ls("resized_images/train/image_directory"), fs::dir_ls("resized_images/validation/image_directory")),
+
+walk(.x = all_images,
      .f = ~ s3$upload_file(Bucket = "weratedogs",
                                    Filename = .x,
                                    Key = str_remove(.x, "resized_images/")))
+
 s3$upload_file(Bucket = "weratedogs",
               Filename = "resized_images/validation/validation_lst.lst", 
               Key = "validation_lst/validation_lst.lst")
+
 s3$upload_file(Bucket = "weratedogs",
               Filename = "resized_images/train/train_lst.lst",
               Key = "train_lst/train_lst.lst")
@@ -170,8 +177,6 @@ s3$upload_file(Bucket = "weratedogs",
 
 https://github.com/aws/amazon-sagemaker-examples/blob/master/introduction_to_amazon_algorithms/imageclassification_caltech/Image-classification-fulltraining-highlevel.ipynb
 
-
-weratedogs/train/all_images/happy.jpg
 Log onto the console -> IAM -> Roles -> Create Role
 Create a service-linked role with sagemaker.amazonaws.com
 Give the role AmazonSageMakerFullAccess
@@ -184,6 +189,7 @@ iam <- boto3$client('iam',
                    aws_secret_access_key = Sys.getenv('AWS_SECRET_ACCESS_KEY'),
                    aws_access_key_id = Sys.getenv('AWS_ACCESS_KEY_ID'),
                    region_name = "us-east-1")
+
 role_arn <- iam$get_role(RoleName = "sagemaker_role")$Role$Arn
 ```
 
@@ -198,7 +204,6 @@ training_image <- "811284229777.dkr.ecr.us-east-1.amazonaws.com/image-classifica
 ```{r}
 sagemaker <- import('sagemaker')
 sess <- sagemaker$Session(boto3$session$Session(region_name = "us-east-1"))
-
 ```
 
 ```{r}
@@ -215,7 +220,6 @@ ic <- sagemaker$estimator$Estimator(
 ```
 
 ```{r}
-# train_set <- dir_ls("resized_images/train/image_directory")
 ic$set_hyperparameters(
     num_layers=as.integer(18),
     image_shape="3,1000,750",
@@ -229,6 +233,8 @@ ic$set_hyperparameters(
 ```
 
 https://sagemaker-examples.readthedocs.io/en/latest/introduction_to_amazon_algorithms/imageclassification_caltech/Image-classification-lst-format-highlevel.html
+
+If time: figure out how to do this in a for loop/nicer way 
 ```{r}
 s3train <- "s3://weratedogs/train/"
 s3validation <- "s3://weratedogs/validation/"
@@ -316,6 +322,8 @@ outputs = list_objects(s3_client, "sagemaker-us-east-1-461249631240", batch_job_
 print("Sample output: " + str(outputs[:2]))
 
 labels = [get_label(s3_client, "sagemaker-us-east-1-461249631240", prefix) for prefix in outputs]
+
+[x[0] for x in labels]
 ```
 
-
+It's all low! Shock. That's cause it's more common
