@@ -25,10 +25,7 @@ cleaned_weratedogs <- weratedogs %>%
          name = str_extract(text, "This is [A-Za-z]+.")) %>%
   filter(!is.na(rating), 
          !is.na(name)) %>%
-  mutate(name = str_remove(name, "This is ")) %>%
-  mutate(name = str_remove(name, "\\."),
-         rating = str_remove(rating, "/"),
-         name = str_remove(name, " ")) %>%
+  mutate(name = str_remove_all(name, "This is |\\.|/| ")) %>%
   filter(rating <= 15) %>%
   mutate(dichotimized_rating = if_else(rating <= 13, 0, 1)) %>%
   # remove duplicate names 
@@ -71,6 +68,7 @@ walk(jpg_files, file_delete)
 
 ```{r}
 set.seed(42)
+# Sorry Jenny Bryan
 setwd("resized_images")
 dir_create("holdout/image_directory")
 dir_create("train/image_directory")
@@ -91,9 +89,8 @@ walk(validation_set, ~ file_move(.x, paste0("validation/image_directory/", .x)))
 
 # create files with .lst
 
-Temporary
-
 ```{r}
+# run if you've restarted since creating holdout train and validation set
 holdout_set <- dir_ls("resized_images/holdout/image_directory")
 train_set <- dir_ls("resized_images/train/image_directory")
 validation_set <- dir_ls("resized_images/validation/image_directory")
@@ -103,10 +100,8 @@ validation_set <- dir_ls("resized_images/validation/image_directory")
 pictures_split <- tibble("file_name" = holdout_set, "location" = "holdout") %>%
   bind_rows(tibble("file_name" = validation_set, "location" = "validation")) %>%
   bind_rows(tibble("file_name" = train_set, "location" = "train")) %>%
-  mutate(file_name = as.character(file_name)) %>%
-  mutate(file_name = str_remove(file_name, "resized_images/validation/image_directory/"),
-         file_name = str_remove(file_name, "resized_images/train/image_directory/"),
-         file_name = str_remove(file_name, "resized_images/holdout/image_directory/"))
+  mutate(file_name = as.character(file_name),
+         file_name = str_remove_all(file_name,"resized_images/validation/image_directory/|resized_images/train/image_directory/|resized_images/holdout/image_directory/"))
 
 lst_info <- cleaned_weratedogs %>%
   mutate(file_name = paste0(name, ".jpg")) %>%
@@ -132,24 +127,26 @@ write.table(train_lst, file = "resized_images/train/train_lst.lst",
 ### Upload to AWS
 
 ```{r}
-# You'll need set your environment with AWS variables
+# You'll need to set your environment with AWS variables. Add the commented lines (without the #) into your R environment, replacing "abc" and "dfg" with your keys
 usethis::edit_r_environ()
-#   AWS_ACCESS_KEY_ID = "abc",
+#  AWS_ACCESS_KEY_ID = "abc",
 #  AWS_SECRET_ACCESS_KEY = "dfg",
 #  AWS_REGION = "us-east-1"
 ```
 
 ```{r}
 # Only need to install the packages once 
-# py_install("sagemaker-python-sdk")
-# py_install("pandas")
+py_install("sagemaker-python-sdk")
+py_install("pandas")
+boto3 <- import('boto3')
 ```
 
 ```{r}
-boto3 <- import('boto3')
 s3 <- boto3$client('s3', 
                    aws_secret_access_key = Sys.getenv('AWS_SECRET_ACCESS_KEY'),
                    aws_access_key_id = Sys.getenv('AWS_ACCESS_KEY_ID'))
+
+s3$create_bucket(Bucket = "weratedogs")
 ```
 
 ```{r}
@@ -157,13 +154,13 @@ all_images <- c(dir_ls("resized_images/holdout/image_directory"),
                 dir_ls("resized_images/train/image_directory"),
                 dir_ls("resized_images/validation/image_directory"))
 
-s3$create_bucket(Bucket = "weratedogs")
-
 walk(.x = all_images,
      .f = ~ s3$upload_file(Bucket = "weratedogs",
-                                   Filename = .x,
-                                   Key = str_remove(.x, "resized_images/")))
+                           Filename = .x,
+                           Key = str_remove(.x, "resized_images/")))
+```
 
+```{r}
 s3$upload_file(Bucket = "weratedogs",
               Filename = "resized_images/validation/validation_lst.lst", 
               Key = "validation_lst/validation_lst.lst")
@@ -174,14 +171,12 @@ s3$upload_file(Bucket = "weratedogs",
 ```
 
 ### Get model ready 
-
-https://github.com/aws/amazon-sagemaker-examples/blob/master/introduction_to_amazon_algorithms/imageclassification_caltech/Image-classification-fulltraining-highlevel.ipynb
-
-Log onto the console -> IAM -> Roles -> Create Role
-Create a service-linked role with sagemaker.amazonaws.com
-Give the role AmazonSageMakerFullAccess
-Give the role AmazonS3FullAccess (<-- scope down if reasonable)
-Then use the name in RoleName= like above
+To create an IAM Role with the right permissions: 
+- Log onto the console -> IAM -> Roles -> Create Role
+- Create a service-linked role with sagemaker.amazonaws.com
+- Give the role AmazonSageMakerFullAccess
+- Give the role AmazonS3FullAccess 
+- Name is "sagemaker_role"
 From https://github.com/aws/sagemaker-python-sdk/issues/300
 
 ```{r}
@@ -194,8 +189,8 @@ role_arn <- iam$get_role(RoleName = "sagemaker_role")$Role$Arn
 ```
 
 ```{r}
-# this doesn't work, so found it manually with jupyter notebook 
-#training_image <- sagemaker$image_uris$retrieve(framework = "image_classification", region ="us-east-1")
+# commented code below doesn't work, so found it manually with a jupyter notebook 
+# training_image <- sagemaker$image_uris$retrieve(framework = "image_classification", region ="us-east-1")
 training_image <- "811284229777.dkr.ecr.us-east-1.amazonaws.com/image-classification:1"
 ```
 
@@ -232,75 +227,52 @@ ic$set_hyperparameters(
 )
 ```
 
-https://sagemaker-examples.readthedocs.io/en/latest/introduction_to_amazon_algorithms/imageclassification_caltech/Image-classification-lst-format-highlevel.html
-
-If time: figure out how to do this in a for loop/nicer way 
 ```{r}
-s3train <- "s3://weratedogs/train/"
-s3validation <- "s3://weratedogs/validation/"
-s3train_lst <- "s3://weratedogs/train_lst/"
-s3validation_lst <- "s3://weratedogs/validation_lst/"
+training_input <- function(s3_data) {
+  sagemaker$inputs$TrainingInput(
+    s3_data,
+    distribution="FullyReplicated",
+    content_type="application/x-image",
+    s3_data_type="S3Prefix"
+  )
+}
 
-train_data <- sagemaker$inputs$TrainingInput(
-    s3_data = s3train,
-    distribution="FullyReplicated",
-    content_type="application/x-image",
-    s3_data_type="S3Prefix"
-)
-validation_data <- sagemaker$inputs$TrainingInput(
-    s3validation,
-    distribution="FullyReplicated",
-    content_type="application/x-image",
-    s3_data_type="S3Prefix"
-)
-train_data_lst <- sagemaker$inputs$TrainingInput(
-    s3train_lst,
-    distribution="FullyReplicated",
-    content_type="application/x-image",
-    s3_data_type="S3Prefix"
-)
-
-validation_data_lst <- sagemaker$inputs$TrainingInput(
-    s3validation_lst,
-    distribution="FullyReplicated",
-    content_type="application/x-image",
-    s3_data_type="S3Prefix"
-)
+train_data <- training_input("s3://weratedogs/train/")
+validation_data <- training_input("s3://weratedogs/validation/")
+train_data_lst <- training_input("s3://weratedogs/train_lst/")
+validation_data_lst <- training_input("s3://weratedogs/validation_lst/")
 
 data_channels <- py_dict(keys = c("train", "validation", "train_lst", "validation_lst"), 
                          values = c(train_data, validation_data, train_data_lst, validation_data_lst))
 ```
 
-Then try moving lst files into validation_lst and train_list folders instead
+Need to follow instructions on https://medium.com/data-science-bootcamp/amazon-sagemaker-ml-p2-xlarge-8b9cbc0dd7d to get access to machine that can be used with the image classification model. 
+
 ```{r}
 ic$fit(inputs = data_channels, logs = TRUE)
 ```
 
-https://medium.com/data-science-bootcamp/amazon-sagemaker-ml-p2-xlarge-8b9cbc0dd7d
-
-have to do as.integer() otherwise get error about class float instead of class int 
-```{r}
-transformer <- ic$transformer(instance_count=as.integer(1), instance_type='ml.m4.xlarge')
-```
-
-```{r}
-transformer$transform(s3validation)
-```
+### Get Predictions
 
 You have to do a batch transform job to figure out how your model performed in terms of actual predictions - can get accuracy from the logs but maybe just predicted everything is one class. 
 
-# look at 
+```{r}
+transformer <- ic$transformer(instance_count=as.integer(1), instance_type='ml.m4.xlarge')
+transformer$transform(s3validation)
+```
 
 ```{python}
 import boto3
-s3_client = boto3.client("s3")
 import numpy as np
 import json
+from urllib.parse import urlparse
+
+s3_client = boto3.client("s3")
 s3validation = "s3://weratedogs/validation/"
 bucket = "weratedogs"
 object_categories = ["low", "high"]
-from urllib.parse import urlparse
 batch_job_name = "image-classification-2021-10-09-00-48-44-562"
+
 def list_objects(s3_client, bucket, prefix):
     response = s3_client.list_objects(Bucket=bucket, Prefix=prefix)
     objects = [content["Key"] for content in response["Contents"]]
@@ -325,5 +297,3 @@ labels = [get_label(s3_client, "sagemaker-us-east-1-461249631240", prefix) for p
 
 [x[0] for x in labels]
 ```
-
-It's all low! Shock. That's cause it's more common
