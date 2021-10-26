@@ -258,7 +258,7 @@ You have to do a batch transform job to figure out how your model performed in t
 
 ```{r}
 transformer <- ic$transformer(instance_count=as.integer(1), instance_type='ml.m4.xlarge')
-transformer$transform(s3validation)
+transformer$transform("s3://weratedogs/validation/")
 ```
 
 ```{python}
