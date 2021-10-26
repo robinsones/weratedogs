@@ -1,0 +1,1 @@
+Code for my talk on October 26, 2021 to the SLC R Users Group, ["A UseR's Introduction to Machine Learning in AWS"](https://docs.google.com/presentation/d/1po0xPOujqzrfFZgYrMEhWcY68nVagZQk/edit?usp=sharing&ouid=109190959859378036463&rtpof=true&sd=true).
